@@ -35,3 +35,6 @@ scratch.py
 
 # May remove TranskribusPyClient as don't use, exclude for now
 /TranskribusPyClient/
+accession_workflow/data/Transkribus_credential.py
+accession_workflow/data/.trnskrbs/
+accession_workflow/data/tkb_client_scratch.py
