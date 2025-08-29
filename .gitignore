@@ -32,3 +32,6 @@ logs/
 
 # Working file
 scratch.py
+
+# May remove TranskribusPyClient as don't use, exclude for now
+/TranskribusPyClient/
