@@ -1,4 +1,4 @@
-from asyncio import Queue
+from asyncio import Queue, gather
 import io
 import logging
 import time
@@ -25,10 +25,10 @@ music_search_kwargs = {
 
 
 def search_brief_bib(
+    session: MetadataSession,
     ti: Optional[str] = None,
     au: Optional[str] = None,
     isbn: Optional[Union[str, int]] = None,
-    session: MetadataSession = None,
     search_kwargs: Optional[Dict[str, Union[None, int, str]]] = {}
 ) -> Dict[str, str]:
     """
@@ -54,6 +54,9 @@ def get_full_bib(
     brief_bibs: Dict[str, Union[int, Dict[str, str]]],
     session: MetadataSession
 ) -> Union[None, List[Record]]:
+    """
+    Use OCLC numbers in brief bibs to retrieve full MARC xml records
+    """
     if brief_bibs["numberOfRecords"] == 0:
         return None
     else:
@@ -68,12 +71,12 @@ def get_full_bib(
 
 async def process_queue(
     queue: Queue,
-    name: Optional[str] = None,
-    session: AsyncMetadataSession = None,
+    session: AsyncMetadataSession,
+    tracker: tqdm,
+    name: Optional[str|None] = None,
     search_kwargs: Optional[Dict[str, Union[None, int, str]]] = {},
     brief_bibs_out: Dict[int, Union[None, str, Dict[str, str]]] = {},
     full_bibs_out: Dict[int, List[Union[Record, str]]] = {},
-    tracker: tqdm = None
 ):
     while True:
         work_item = await queue.get()
@@ -107,8 +110,8 @@ async def process_queue(
                 brief_bibs = await async_search_brief_bib_cac(ti=ti, au=au, isbn=isbn, session=session, search_kwargs=search_kwargs)
                 brief_bibs_out[idx] = brief_bibs
 
-                # if brief_bibs["numberOfRecords"] > 0:
-                #     await asyncio.gather(*[queue.put((idx, res["oclcNumber"])) for res in brief_bibs["briefRecords"]])
+                if brief_bibs["numberOfRecords"] > 0:
+                    await gather(*[queue.put((idx, res["oclcNumber"])) for res in brief_bibs["briefRecords"]])
 
                 tracker.update(n=1)
                 t1 = time.perf_counter()
@@ -143,7 +146,7 @@ async def async_search_brief_bib_cac(
     ti: Optional[str],
     au: Optional[str],
     isbn: Optional[int],
-    session: AsyncMetadataSession = None,
+    session: AsyncMetadataSession,
     search_kwargs: Optional[Dict[str, Union[None, int, str]]] = {}
 ) -> Dict[str, str]:
     """
@@ -180,3 +183,22 @@ async def async_search_brief_bib_music(
     res = await session.brief_bibs_search(q=query, **search_kwargs)
 
     return res.json()
+
+
+async def async_get_full_bib(
+    brief_bibs: Dict[str, Union[int, Dict[str, str]]],
+    session: AsyncMetadataSession
+) -> Union[None, List[Record]]:
+    """
+    Use OCLC numbers in brief bibs to retrieve full MARC xml records
+    """
+    if brief_bibs["numberOfRecords"] == 0:
+        return None
+    else:
+        recs = brief_bibs["briefRecords"]
+        oclc_nums = [x["oclcNumber"] for x in recs]
+        if len(set(oclc_nums)) != len(oclc_nums):
+            raise ValueError("Non unique OCLC numbers returned by brief bibs search")
+        matched_xml = [session.bib_get(rec["oclcNumber"]).text for rec in recs]
+        matched_records = [marcxml.parse_xml_to_array(io.StringIO(x))[0] for x in matched_xml]
+        return matched_records

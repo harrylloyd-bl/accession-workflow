@@ -5,16 +5,16 @@ import logging
 import pickle
 import os
 import re
+import time
+from typing import Any
 import xml.etree.ElementTree as ET
 
 from dotenv import load_dotenv
 import requests
 from tqdm import tqdm
 import bookops_worldcat as bw
-from TranskribusPyClient.src.TranskribusPyClient import client
 
-from src.data.oclc_api import process_queue, cac_search_kwargs
-from cfg import COL_ID, DOC_ID, PRINT_M1_ID
+from accession_workflow.data.oclc_api import process_queue, cac_search_kwargs
 
 load_dotenv()
 
@@ -56,28 +56,27 @@ def run_text_recognition(access_token, collection_id, doc_id, model_id, pages="a
     session = requests.Session()
 
     try:
-        # Step 2: Start text recognition job
-        recognition_url = f"{base_url}/recognition/htr"
+        # Start text recognition job
+        headers = {"Authorization": f"Bearer {access_token}",
+                   "Content-Type": "application/json"}
+
+        recognition_endpoint = f"{base_url}/pylaia/{collection_id}/{model_id}/recognition"
 
         # Parameters for the recognition job
         recognition_params = {
-            "colId": collection_id,  # the collection id
             "id": doc_id,  # the document id
-            "pages": pages,  # "all" or specific page numbers
-            "modelId": model_id,
-            "doWordSeg": "true",  # Enable word segmentation
-            "doLineSeg": "false",  # Usually false if using existing layout
-            "doPolygonToBaseline": "false"
+            "doLinePolygonSimplification": True,
+            "keepOriginalLinePolygons": False
+            # "doWordSeg": "true",  # Enable word segmentation
         }
 
+        data = {"pages": pages}
         # Start the recognition job
         recognition_response = session.post(
-            recognition_url,
+            recognition_endpoint,
             params=recognition_params,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
+            headers=headers,
+            data=data
         )
         recognition_response.raise_for_status()
 
@@ -85,7 +84,7 @@ def run_text_recognition(access_token, collection_id, doc_id, model_id, pages="a
         job_info = recognition_response.json()
         job_id = job_info.get('jobId')
 
-        print(f"Text recognition job started successfully!")
+        print("Text recognition job started successfully!")
         print(f"Job ID: {job_id}")
         print(f"Collection ID: {collection_id}")
         print(f"Model ID: {model_id}")
@@ -133,17 +132,18 @@ def check_job_status(access_token, collection_id, job_id):
         return None
 
 
-def download_document(access_token, collection_id, doc_id):
+def get_doc_manifest(access_token: str, collection_id: int, doc_id: int) -> dict[any, any]|None:
     """
-    Check the status of a recognition job
+    Download the manifest for a document
+    This contains urls for all xml/jpgs which can then be downloaded separately
 
     Args:
         access_token (str): Tkb access token
         collection_id (int): ID of the collection
-        job_id (str): ID of the job to check
+        doc_id (str): ID of the doc to download
 
     Returns:
-        dict: Job status information
+        doc_manifest: Document manifest
     """
     base_url = "https://transkribus.eu/TrpServer/rest"
     session = requests.Session()
@@ -153,12 +153,34 @@ def download_document(access_token, collection_id, doc_id):
         # Check job status
         get_doc_url = f"{base_url}/collections/{collection_id}/{doc_id}/fulldoc"
         doc_response = session.get(get_doc_url, headers=headers)
-        doc_contents = doc_response.json()
-        n = len(doc_contents["pageList"]["pages"])
+        doc_response.raise_for_status()
+        print(f"Get doc info successful. Status code: {doc_response.status_code}")
+        doc_manifest = doc_response.json()
+
+        return doc_manifest
+    
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading doc manifest: {e}")
+        return None
+    
+
+def download_doc(doc_id: int, doc_manifest: dict[Any, Any], out_path: str|os.PathLike) -> None:
+    """
+    Download a complete document
+
+    Args:
+        doc_manifest (dict): The manifest for a document, containing jpg/xml urls
+        doc_id (str): ID of the doc to download
+
+    Returns:
+        None
+    """
+    try:
+        n = len(doc_manifest["pageList"]["pages"])
 
         # TODO link title and ISBN pages
         print("Downloading images and xmls")
-        for i, page in tqdm(enumerate(doc_contents["pageList"]["pages"]), total=n):
+        for i, page in tqdm(enumerate(doc_manifest["pageList"]["pages"]), total=n):
             if i / 2 == float(i // 2):
                 suffix = "title"
             else:
@@ -168,16 +190,14 @@ def download_document(access_token, collection_id, doc_id):
 
             img_resp = requests.get(page["url"])
             xml_resp = requests.get(page['tsList']['transcripts'][0]['url'])
-            if not os.path.exists(f"data/raw/{doc_id}"):
-                os.mkdir(f"data/raw/{doc_id}")
-            with open(f"data/raw/{doc_id}/{work}_{suffix}.jpg", "wb") as f:
+            if not os.path.exists(f"{out_path}/{doc_id}"):
+                os.mkdir(f"{out_path}/{doc_id}")
+            with open(f"{out_path}/{doc_id}/{work}_{suffix}.jpg", "wb") as f:
                 f.write(img_resp.content)
-            with open(f"data/raw/{doc_id}/{work}_{suffix}.xml", "wb") as f:
+            with open(f"{out_path}/{doc_id}/{work}_{suffix}.xml", "wb") as f:
                 f.write(xml_resp.content)
 
-        print(f"Images and xml downloaded for {len(doc_contents['pageList']['pages']) // 2} works")
-
-        return doc_response.raise_for_status()
+        print(f"Images and xml downloaded for {len(doc_manifest['pageList']['pages']) // 2} works")
 
     except requests.exceptions.RequestException as e:
         print(f"Error downloading doc: {e}")
@@ -216,7 +236,7 @@ def extract_lines(xml_roots: dict[str: ET]) -> dict[str: list[str]]:
             text_lines = text_region[1:-1]  # Skip coordinate data in first child
             for text_line in text_lines:
                 lines.append(text_line[-1][0].text)  # Text equivalent for line
-        page_lines[id] = [l for l in lines if l]
+        page_lines[id] = [line for line in lines if line]
 
     return page_lines
 
@@ -227,7 +247,7 @@ def extract_bib_info(page_lines: dict[str: list[str]]):
     @param page_lines:
     @return:
     """
-    isbn_regex = re.compile("ISBN\s(?P<ISBN>[0-9\-\s]+)")
+    isbn_regex = re.compile(r"ISBN\s(?P<ISBN>[0-9\-\s\.]+)")
     work_bib_info = {page_nr.split("_")[0]: {} for page_nr, _ in page_lines.items()}
     # TODO at the moment the title page transcription is bad due to the large font sizes
     # Just use ISBN for now
@@ -240,7 +260,7 @@ def extract_bib_info(page_lines: dict[str: list[str]]):
                 match = isbn_regex.search(line)
                 if match:
                     ISBN = match.group("ISBN")
-                    clean_isbn = ISBN.replace("-", "").replace(" ", "")
+                    clean_isbn = ISBN.replace("-", "").replace(" ", "").replace(".", "")
                     work_bib_info[page_nr]["ISBN"] = clean_isbn
 
         elif "title" in page_nr:
@@ -258,11 +278,13 @@ def extract_bib_info(page_lines: dict[str: list[str]]):
     return work_bib_info
 
 
-async def oclc_record_fetch(work_bib_info, out_path):
-
-    brief_bibs = {}
-    full_bibs = {}
-    full_bibs = {k: [] for k in full_bibs}
+async def oclc_record_fetch(work_bib_info, brief_out: str|os.PathLike, full_out: str|os.PathLike, run_id: str, token: bw.WorldcatAccessToken) -> None:
+    """
+    Process bib info extracted from book pages by querying for brief bibs
+    Then querying for OCLC numbers based on brief bibs
+    """
+    brief_bibs = {k: {} for k in work_bib_info}
+    full_bibs = {k: [] for k in work_bib_info}
 
     async with bw.AsyncMetadataSession(authorization=token, headers={"User-Agent": "Convert-a-Card/1.0"}) as session:
 
@@ -281,7 +303,7 @@ async def oclc_record_fetch(work_bib_info, out_path):
 
         for i in range(n_workers):  # create workers
             task = asyncio.create_task(
-                process_queue(
+                process_queue(  # Queue also processes the full bib calls
                     queue=queue,
                     name=f'worker-{i}',
                     session=session,
@@ -294,7 +316,6 @@ async def oclc_record_fetch(work_bib_info, out_path):
 
             tasks.append(task)
 
-        global run_id
         t0 = time.perf_counter()
         logging.info(f"{run_id} OCLC query queue joined")
 
@@ -310,64 +331,38 @@ async def oclc_record_fetch(work_bib_info, out_path):
 
         # records_df["brief_bibs"] = brief_bibs
         # records_df["worldcat_matches"] = full_bibs
-        pickle.dump(brief_bibs, open(out_path, "wb"))
+        pickle.dump(brief_bibs, open(brief_out, "wb"))
+        pickle.dump(full_bibs, open(full_out, "wb"))
 
 
-if __name__ == "__main__":
-    login_response = authorise()
-    login_response.raise_for_status()
+def init_loggers(complete_path: str|os.PathLike, progress_path: str|os.PathLike, error_path: str|os.PathLike) -> None:
+    """
+    Initialise loggers for the workflow. This is mainly to track the async OCLC calls.
+    Args:
+        complete_path: str|os.Pathlike
+        progress_path: str|os.Pathlike
+        error_path: str|os.Pathlike
 
-    print(f"Login successful. Status code: {login_response.status_code}")
-    access_token = login_response.json()["access_token"]
+    Returns: None
 
-    ## Running the transcription
-    ATR = False
-    if ATR:
-        # Start text recognition
-        job_info = run_text_recognition(
-            access_token=access_token,
-            collection_id=DOC_ID,
-            model_id=PRINT_M1_ID,
-            pages="all"  # or specific pages like "1,2,3"
-        )
+    """
+    logging.basicConfig(filename=complete_path,
+                        format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                        datefmt='%m-%d %H:%M',
+                        encoding='utf-8',
+                        level=logging.DEBUG)
 
-        if job_info and 'jobId' in job_info:
-            job_id = job_info['jobId']
+    # All logging statements go to complete_log, only logging.info statements go to progress_log
+    progress = logging.FileHandler(filename=progress_path)
+    progress.setLevel(logging.INFO)
+    prog_formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s', datefmt='%m-%d %H:%M')
+    progress.setFormatter(prog_formatter)
+    logging.getLogger("").addHandler(progress)
 
-            # Check job status
-            import time
+    error = logging.FileHandler(filename=error_path)
+    error.setLevel(logging.ERROR)
+    err_formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s', datefmt='%m-%d %H:%M')
+    error.setFormatter(err_formatter)
+    logging.getLogger("").addHandler(error)
 
-            time.sleep(5)  # Wait a bit before checking status
-
-            status = check_job_status(
-                access_token=access_token,
-                collection_id=DOC_ID,
-                job_id=job_id
-            )
-
-    ## DL outputs
-    DL = False
-    if DL:
-        download_document(access_token=access_token, collection_id=COL_ID, doc_id=DOC_ID)
-
-    # Extract titles/ISBNs
-    xml_roots = load_xmls(f"data/raw/{DOC_ID}/*.xml")
-    lines = extract_lines(xml_roots)
-    bib_info = extract_bib_info(lines)
-    print(bib_info)
-
-    # Query OCLC
-    client_id = os.environ["CLIENT_ID"]
-    client_secret = os.environ["CLIENT_SECRET"]
-
-    # token = bw.WorldcatAccessToken(
-    #     key=client_id,
-    #     secret=client_secret,
-    #     scopes="WorldCatMetadataAPI",
-    #     agent="ConvertACard/1.0"
-    # )
-
-    # asyncio.run(oclc_record_fetch(bib_info, "data/processed/accession_test_brief_bibs.p"))
-
-    # Make results available for ST app
-    # St app should be used side by side with Record Manager, so this automated part ends there
+    return None
